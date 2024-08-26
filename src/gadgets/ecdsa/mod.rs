@@ -39,7 +39,7 @@ pub struct ECDSA<C: CurveGroup> {
     _group: PhantomData<C>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Parameters<C: CurveGroup> {
     pub generator: C::Affine,
 }
@@ -48,12 +48,13 @@ pub type PublicKey<C> = <C as CurveGroup>::Affine;
 
 pub struct SecretKey<C: CurveGroup>(pub C::ScalarField);
 
+#[derive(Clone, Debug)]
 pub struct Signature<C: CurveGroup> {
     pub r: C::ScalarField,
     pub s: C::ScalarField,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Randomness<C: CurveGroup>(pub C::ScalarField);
 impl<C: CurveGroup> UniformRand for Randomness<C> {
     fn rand<R: Rng + ?Sized>(rng: &mut R) -> Self {
@@ -94,7 +95,7 @@ impl<C: CurveGroup> SignatureScheme for ECDSA<C> {
     ) -> Result<Self::Signature, Error> {
         let k: C::ScalarField = C::ScalarField::rand(rng);
         let p: C::Affine = parameters.generator.mul(k).into();
-        let r = base_to_scalar(*p.x().unwrap());
+        let r = base_to_scalar(p.x().unwrap());
         let s = k.inverse().unwrap() * (hash.0 + secret_key.0 * r);
         Ok(Signature { r, s })
     }
@@ -107,16 +108,21 @@ impl<C: CurveGroup> SignatureScheme for ECDSA<C> {
         signature: &Self::Signature,
     ) -> Result<bool, Error> {
         let s_inv = signature.s.inverse().unwrap();
+        // print all parameter
+        println!(
+            "s_inv: {:?} h: {:?} r: {:?} public_key: {:?}",
+            s_inv, hash.0, signature.r, public_key
+        );
         let u1 = s_inv * hash.0;
         let u2 = s_inv * signature.r;
         let p: C::Affine = (parameters.generator.mul(u1) + public_key.mul(u2)).into();
-        let r: C::ScalarField = base_to_scalar(*p.x().unwrap());
+        let r: C::ScalarField = base_to_scalar(p.x().unwrap());
         Ok(r == signature.r)
     }
 }
 
 /// Convert a base field element into a scalar field element.
-pub fn base_to_scalar<Fq: Field, Fr: PrimeField>(base_elem: Fq) -> Fr {
+pub fn base_to_scalar<Fq: Field, Fr: PrimeField>(base_elem: &Fq) -> Fr {
     let mut base_elem_vec = Vec::new();
     base_elem
         .serialize_uncompressed(&mut base_elem_vec)
@@ -124,19 +130,37 @@ pub fn base_to_scalar<Fq: Field, Fr: PrimeField>(base_elem: Fq) -> Fr {
     Fr::from_le_bytes_mod_order(&base_elem_vec)
 }
 
+/// Convert a base field element into a scalar field element.
+pub fn scalar_to_base<Fq: Field, Fr: PrimeField>(scalar_elem: &Fr) -> Fq {
+    let mut scalar_elem_vec = Vec::new();
+    scalar_elem
+        .serialize_uncompressed(&mut scalar_elem_vec)
+        .unwrap();
+    Fq::from_random_bytes(&scalar_elem_vec).unwrap()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use ark_bn254;
     use ark_ff::{BigInt, One, PrimeField};
+    use ark_r1cs_std::fields::fp::FpVar;
     use ark_secp256k1;
 
     #[test]
     fn test_base_to_scalar() {
         let fr_mod = (-ark_bn254::Fr::one()).into_bigint();
         let fr_mod = ark_bn254::Fq::from_bigint(fr_mod).unwrap();
-        let fr_mod: BigInt<4> = base_to_scalar::<ark_bn254::Fq, ark_bn254::Fr>(fr_mod).into();
+        let fr_mod: BigInt<4> = base_to_scalar::<ark_bn254::Fq, ark_bn254::Fr>(&fr_mod).into();
         assert_eq!(fr_mod, (-ark_bn254::Fr::one()).into_bigint());
+    }
+
+    #[test]
+    fn test_scalar_to_base() {
+        let fr = ark_bn254::Fr::rand(&mut ark_std::test_rng());
+        let fq_predict = ark_bn254::Fq::from_bigint(fr.into_bigint()).unwrap();
+        let fq = scalar_to_base::<ark_bn254::Fq, ark_bn254::Fr>(&fr);
+        assert_eq!(fq, fq_predict);
     }
 
     #[test]

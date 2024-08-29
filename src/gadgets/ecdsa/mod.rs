@@ -96,7 +96,9 @@ impl<C: CurveGroup> SignatureScheme for ECDSA<C> {
         let k: C::ScalarField = C::ScalarField::rand(rng);
         let p: C::Affine = parameters.generator.mul(k).into();
         let r = base_to_scalar(p.x().unwrap());
-        let s = k.inverse().unwrap() * (hash.0 + secret_key.0 * r);
+        let s = hash.0 + secret_key.0 * r;
+        let s = k.inverse().unwrap() * s;
+
         Ok(Signature { r, s })
     }
 
@@ -110,13 +112,20 @@ impl<C: CurveGroup> SignatureScheme for ECDSA<C> {
         let s_inv = signature.s.inverse().unwrap();
         // print all parameter
         println!(
-            "s_inv: {:?} h: {:?} r: {:?} public_key: {:?}",
-            s_inv, hash.0, signature.r, public_key
+            "s_inv: {:?} h: {:?} r: {:?} public_key: {:?} base: {:?}",
+            s_inv, hash.0, signature.r, public_key, parameters.generator
         );
+
+        println!("expected pk_x: {:?}", public_key.x().unwrap());
+        println!("expected pk_y: {:?}", public_key.y().unwrap());
+
         let u1 = s_inv * hash.0;
         let u2 = s_inv * signature.r;
+
         let p: C::Affine = (parameters.generator.mul(u1) + public_key.mul(u2)).into();
+        println!("expected lhs + rhs : {:?}", p);
         let r: C::ScalarField = base_to_scalar(p.x().unwrap());
+        println!("expected_res : {:?}", r);
         Ok(r == signature.r)
     }
 }
@@ -145,7 +154,10 @@ mod test {
     use ark_bn254;
     use ark_ff::{BigInt, One, PrimeField};
     use ark_r1cs_std::fields::fp::FpVar;
+    use ark_ed_on_bn254;
     use ark_secp256k1;
+    use ark_std::rand::SeedableRng;
+    use ark_std::test_rng;
 
     #[test]
     fn test_base_to_scalar() {
@@ -157,46 +169,76 @@ mod test {
 
     #[test]
     fn test_scalar_to_base() {
-        let fr = ark_bn254::Fr::rand(&mut ark_std::test_rng());
+        let mut rng = &mut test_rng();
+        let fr = ark_bn254::Fr::rand(rng);
         let fq_predict = ark_bn254::Fq::from_bigint(fr.into_bigint()).unwrap();
         let fq = scalar_to_base::<ark_bn254::Fq, ark_bn254::Fr>(&fr);
         assert_eq!(fq, fq_predict);
     }
 
     #[test]
-    fn test_ecdsa_bn254() {
-        let parameter = ECDSA::<ark_bn254::G1Projective>::setup(&mut ark_std::test_rng()).unwrap();
+    fn test_ecdsa_ed_bn254() {
+        let mut rng = &mut test_rng();
+        type MyCurveGroup = ark_ed_on_bn254::EdwardsProjective;
+        let parameter = ECDSA::<MyCurveGroup>::setup(rng).unwrap();
         let (sk, pk) =
-            ECDSA::<ark_bn254::G1Projective>::keygen(&parameter, &mut ark_std::test_rng()).unwrap();
-        let hash = Hash(ark_bn254::Fr::rand(&mut ark_std::test_rng()));
-        let signature = ECDSA::<ark_bn254::G1Projective>::sign(
+            ECDSA::<MyCurveGroup>::keygen(&parameter, rng).unwrap();
+        let hash = Hash(ark_ed_on_bn254::Fr::rand(rng));
+        let signature = ECDSA::<MyCurveGroup>::sign(
             &parameter,
             &sk,
             &hash,
-            &mut ark_std::test_rng(),
+            rng,
         )
         .unwrap();
+
         let output =
-            ECDSA::<ark_bn254::G1Projective>::verify(&parameter, &pk, &hash, &signature).unwrap();
+                ECDSA::<MyCurveGroup>::verify(&parameter, &pk, &hash, &signature).unwrap();
         assert_eq!(output, true);
     }
 
     #[test]
+    fn test_ecdsa_bn254() {
+        let mut rng = &mut test_rng();
+
+        let parameter = ECDSA::<ark_bn254::G1Projective>::setup(rng).unwrap();
+        let (sk, pk) =
+            ECDSA::<ark_bn254::G1Projective>::keygen(&parameter, rng).unwrap();
+        let hash = Hash(ark_bn254::Fr::rand(rng));
+        let signature = ECDSA::<ark_bn254::G1Projective>::sign(
+            &parameter,
+            &sk,
+            &hash,
+            rng,
+        )
+            .unwrap();
+
+        println!("signature: {:?}", signature);
+
+            let output =
+                ECDSA::<ark_bn254::G1Projective>::verify(&parameter, &pk, &hash, &signature).unwrap();
+            assert_eq!(output, true);
+
+    }
+
+    #[test]
     fn test_ecdsa_secp256k1() {
+        let mut rng = &mut test_rng();
+
         let parameter =
-            ECDSA::<ark_secp256k1::Projective>::setup(&mut ark_std::test_rng()).unwrap();
+            ECDSA::<ark_secp256k1::Projective>::setup(rng).unwrap();
         let parameter = Parameters {
             generator: ark_secp256k1::Projective::generator().into_affine(),
         };
         let (sk, pk) =
-            ECDSA::<ark_secp256k1::Projective>::keygen(&parameter, &mut ark_std::test_rng())
+            ECDSA::<ark_secp256k1::Projective>::keygen(&parameter,rng)
                 .unwrap();
-        let hash = Hash(ark_secp256k1::Fr::rand(&mut ark_std::test_rng()));
+        let hash = Hash(ark_secp256k1::Fr::rand(rng));
         let signature = ECDSA::<ark_secp256k1::Projective>::sign(
             &parameter,
             &sk,
             &hash,
-            &mut ark_std::test_rng(),
+            rng,
         )
         .unwrap();
         let output =

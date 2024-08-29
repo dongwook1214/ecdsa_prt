@@ -19,3 +19,4 @@ ark-serialize = "0.4.2"
 ark-crypto-primitives = "0.4.0"
 ark-bn254 = "0.4.0"
 ark-ed-on-bn254 = { version = "0.4.0", features = ["r1cs"] }
+ark-nonnative-field = "0.3.0"

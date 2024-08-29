@@ -13,9 +13,12 @@ use ark_serialize::CanonicalSerialize;
 use ark_std::Zero;
 use std::borrow::Borrow;
 use std::marker::PhantomData;
-use std::slice::Iter;
+use ark_r1cs_std::eq::EqGadget;
+use ark_r1cs_std::fields::nonnative::{AllocatedNonNativeFieldVar, NonNativeFieldVar};
 
-pub trait SignatureVerificationGadget<C: SignatureScheme, ConstraintF: Field> {
+
+
+pub trait SignatureVerificationGadget<C: SignatureScheme, ConstraintF: PrimeField> {
     type ParametersVar: AllocVar<C::Parameters, ConstraintF> + Clone;
     type PublicKeyVar: AllocVar<C::PublicKey, ConstraintF> + Clone;
     type SignatureVar: AllocVar<C::Signature, ConstraintF> + Clone;
@@ -78,48 +81,46 @@ where
 }
 
 #[derive(Clone)]
-pub struct SignatureVar<F: PrimeField> {
-    pub r: FpVar<F>,
-    pub s: FpVar<F>,
+pub struct SignatureVar<Fr: PrimeField, Fq: PrimeField> {
+    pub r: NonNativeFieldVar<Fr, Fq>,
+    pub s: NonNativeFieldVar<Fr,Fq>,
 }
 
-impl<C, F> AllocVar<Signature<C>, F> for SignatureVar<F>
+impl<C, Fr, Fq> AllocVar<Signature<C>, Fq> for SignatureVar<Fr, Fq>
 where
-    C: CurveGroup<BaseField = F>,
-    F: PrimeField,
+    C: CurveGroup<ScalarField = Fr>,
+    Fr: PrimeField,
+    Fq: PrimeField,
 {
-    fn new_variable<T: Borrow<Signature<C>>>(
-        cs: impl Into<Namespace<F>>,
-        f: impl FnOnce() -> Result<T, SynthesisError>,
-        mode: AllocationMode,
-    ) -> Result<Self, SynthesisError> {
+    fn new_variable<T: Borrow<Signature<C>>>(cs: impl Into<Namespace<Fq>>, f: impl FnOnce() -> Result<T, SynthesisError>, mode: AllocationMode) -> Result<Self, SynthesisError> {
         let ns = cs.into();
         let cs = ns.cs();
-        let signature:(F, F) = f().map(|s| (scalar_to_base(&s.borrow().r), scalar_to_base(&s.borrow().s))).unwrap();
-        let r = FpVar::new_variable(cs.clone(), || Ok(signature.0), mode)?;
-        let s = FpVar::new_variable(cs, || Ok(signature.1), mode)?;
-        Ok(Self { r, s })
+        f().map(|s|
+            Self {
+                r: NonNativeFieldVar::new_variable(cs.clone(), ||  Ok(s.borrow().r), mode).unwrap(),
+                s: NonNativeFieldVar::new_variable(cs, || Ok(s.borrow().s), mode).unwrap()
+            }
+        )
     }
 }
 
 #[derive(Clone)]
-pub struct HashVar<F: PrimeField>(pub FpVar<F>);
+pub struct HashVar<Fr: PrimeField, Fq: PrimeField>(pub NonNativeFieldVar<Fr, Fq>);
 
-impl<C, F> AllocVar<Hash<C>, F> for HashVar<F>
+impl<C, Fr, Fq> AllocVar<Hash<C>, Fq> for HashVar<Fr, Fq>
 where
-    C: CurveGroup<BaseField = F>,
-    F: PrimeField,
+    C: CurveGroup<ScalarField = Fr>,
+    Fq: PrimeField,
+    Fr: PrimeField,
 {
     fn new_variable<T: Borrow<Hash<C>>>(
-        cs: impl Into<Namespace<F>>,
+        cs: impl Into<Namespace<Fq>>,
         f: impl FnOnce() -> Result<T, SynthesisError>,
         mode: AllocationMode,
     ) -> Result<Self, SynthesisError> {
-        let hash: Result<F ,SynthesisError> = f().map(|h| scalar_to_base(&h.borrow().0));
         let ns = cs.into();
         let cs = ns.cs();
-        let hash = FpVar::new_variable(cs, || hash, mode)?;
-        Ok(Self(hash))
+        f().map(|h| Self(NonNativeFieldVar::new_variable(cs, || Ok(h.borrow().0), mode).unwrap()))
     }
 }
 
@@ -135,11 +136,12 @@ where
     C: CurveGroup,
     GG: CurveVar<C, C::BaseField>,
     C::BaseField: PrimeField,
+    C::BaseField: PrimeField,
 {
     type ParametersVar = ParametersVar<C, GG>;
     type PublicKeyVar = PublicKeyVar<C, GG>;
-    type SignatureVar = SignatureVar<C::BaseField>;
-    type HashVar = HashVar<C::BaseField>;
+    type SignatureVar = SignatureVar<C::ScalarField, C::BaseField>;
+    type HashVar = HashVar<C::ScalarField, C::BaseField>;
 
     /// R ?= (s⁻¹ ⋅ m ⋅ Base + s⁻¹ ⋅ R ⋅ publicKey)_x
     fn verify(
@@ -148,123 +150,118 @@ where
         hash: &Self::HashVar,
         signature: &Self::SignatureVar,
     ) -> Result<Boolean<C::BaseField>, SynthesisError> {
-        let s_inv: FpVar<C::BaseField> = signature.s.inverse()?;
-        let h: FpVar<C::BaseField> = hash.0.clone();
+        let s_inv = signature.s.inverse()?;
+        let h = hash.0.clone();
         let base = parameters.generator.clone();
-        let r: FpVar<C::BaseField> = signature.r.clone();
+        let r = signature.r.clone();
         let public_key = public_key.public_key.clone();
 
-        println!("s_inv: {:?} h: {:?} r: {:?} public_key: {:?}", s_inv.value()?, h.value()?, r.value()?, public_key.value()?);
+        println!("pk: {}", public_key.value()?);
+        let pk = public_key.to_bits_le()?;
+        let pk_x = pk[0..pk.len()/2].to_vec();
+        let pk_y = pk[pk.len()/2..pk.len()].to_vec();
+        let pk_x = Boolean::le_bits_to_fp_var(&pk_x)?;
+        let pk_y = Boolean::le_bits_to_fp_var(&pk_y)?;
+        println!("pk_x: {:?}", pk_x.value()?);
+        println!("pk_y: {:?}", pk_y.value()?);
 
-        let lhs: FpVar<C::BaseField> = s_inv.clone() * h;
-        let lhs: Vec<Boolean<C::BaseField>> = lhs.to_bits_le()?;
+        println!("s_inv: {:?} h: {:?} r: {:?} public_key: {:?} base: {:?}", s_inv.value()?, h.value()?, r.value()?, public_key.value()?.into_affine(), base.value()?.into_affine());
+
+        let lhs = s_inv.clone() * h;
+        let lhs = lhs.to_bits_le()?;
         let lhs = base.scalar_mul_le(lhs.iter())?;
 
         let rhs = s_inv * r.clone();
         let rhs = rhs.to_bits_le()?;
         let rhs = public_key.scalar_mul_le(rhs.iter())?;
 
-        let res = (lhs + rhs).value()?.into();
-        let res = res.x().unwrap().clone();
-        println!("res: {:?} real_res: {:?}", res, &r.value()?);
+        let res = lhs + rhs;
+        println!("lhs + rhs: {:?}", res.value()?.into_affine());
+        let res = res.to_bits_le()?;
+        let res = res[0..res.len()/2].to_vec();
+        let res_y = res[res.len()/2..res.len()].to_vec();
+        let res = Boolean::le_bits_to_fp_var(&res)?;
+        let res_y = Boolean::le_bits_to_fp_var(&res_y)?;
 
-        let res = res.eq(&r.value()?);
 
-        Ok(Boolean::Constant(res))
+        let res_expected = r.to_bits_le()?;
+        let res_expected = Boolean::le_bits_to_fp_var(&res_expected)?;
+
+        println!("res: {:?}", res.value()?);
+        println!("res_y: {:?}", res_y.value()?);
+
+        res_expected.is_eq(&res)
     }
 }
-
-
-// compute s⁻¹ with C::ScalarField::MODULUS: use extended euclidean algorithm
-// fn get_inverse_in_ScalarField  <C: CurveGroup> (s: FpVar<C::BaseField>)-> FpVar<C::BaseField> where C::BaseField: PrimeField {
-//     let modulus = C::ScalarField::MODULUS;
-//     let mut t = FpVar::<C::BaseField>::Constant(<C::BaseField>::zero());
-//     let mut new_t = FpVar::<C::BaseField>::Constant(<C::BaseField>::one());
-//     let mut r = s.clone();
-//     let mut new_r =FpVar::<C::BaseField>::Constant(scalar_to_base(C::ScalarField::from_bigint(modulus).unwrap()));
-//     while !r.is_constant() {
-//         let quotient = r.mul_by_inverse(&new_r)?;
-//         let tmp = new_r.clone();
-//         new_r = r.clone() - quotient.clone() * new_r.clone();
-//         r = tmp;
-//         let tmp = new_t.clone();
-//         new_t = t.clone() - quotient.clone() * new_t.clone();
-//         t = tmp;
-//     }
-//     t
-// }
 
 #[cfg(test)]
 mod test {
     use std::ops::{Add, Mul};
     use ark_bn254;
-    use ark_ec::CurveGroup;
+    use ark_ec::{CurveGroup, Group};
     use ark_r1cs_std::alloc::AllocVar;
     use ark_r1cs_std::groups::CurveVar;
     use crate::gadgets::ecdsa::{Hash, SignatureScheme, ECDSA};
-    use ark_std::UniformRand;
+    use ark_std::{test_rng, UniformRand};
     use crate::gadgets::ecdsa::constraints::ECDSAVerificationGadget;
     use ark_ed_on_bn254::{constraints::EdwardsVar, EdwardsProjective, Fq, Fr};
+    use ark_ed_on_bn254::constraints::FqVar;
     use ark_r1cs_std::fields::fp::FpVar;
+    use ark_r1cs_std::groups::curves::twisted_edwards::AffineVar;
     use ark_r1cs_std::R1CSVar;
+    use ark_relations::ns;
+    use ark_relations::r1cs::Namespace;
     use super::SignatureVerificationGadget;
-
     #[test]
     fn gadget_verify_test() {
+        let mut rng = &mut test_rng();
+
         type MyECDSA = ECDSA<EdwardsProjective>;
 
         type MyECDSAGadget = ECDSAVerificationGadget<EdwardsProjective, EdwardsVar>;
 
-        let parameter = MyECDSA::setup(&mut ark_std::test_rng()).unwrap();
+        let parameter = MyECDSA::setup(rng).unwrap();
         let (sk, pk) =
-            MyECDSA::keygen(&parameter, &mut ark_std::test_rng()).unwrap();
-        let hash = Hash(Fr::rand(&mut ark_std::test_rng()));
+            MyECDSA::keygen(&parameter, rng).unwrap();
+        let hash = Hash(Fr::rand(rng));
         let signature = MyECDSA::sign(
             &parameter,
             &sk,
             &hash,
-            &mut ark_std::test_rng(),
+            rng,
         )
         .unwrap();
-
         let predict_res = MyECDSA::verify(&parameter, &pk, &hash, &signature).unwrap();
-        println!("predict_res: {:?}", predict_res);
-
 
         let cs = ark_relations::r1cs::ConstraintSystem::<Fq>::new_ref();
-
-        let parameterVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, <EdwardsProjective as CurveGroup>::BaseField >>::ParametersVar::new_input(
-            ark_relations::ns!(cs, "parameter"),
+        let parameterVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::ParametersVar::new_variable(
+            ns!(cs, "parameter"),
             || Ok(&parameter),
+            ark_r1cs_std::alloc::AllocationMode::Input
         ).unwrap();
 
-        let pkVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, <EdwardsProjective as CurveGroup>::BaseField >>::PublicKeyVar::new_input(
-            ark_relations::ns!(cs, "pk"),
+        let pkVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::PublicKeyVar::new_variable(
+            ns!(cs, "pk"),
             || Ok(&pk),
+            ark_r1cs_std::alloc::AllocationMode::Input
         ).unwrap();
 
-        let hashVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, <EdwardsProjective as CurveGroup>::BaseField >>::HashVar::new_input(
-            ark_relations::ns!(cs, "hash"),
+        let hashVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::HashVar::new_variable(
+            ns!(cs, "hash"),
             || Ok(&hash),
+            ark_r1cs_std::alloc::AllocationMode::Input
         ).unwrap();
 
-        let signatureVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, <EdwardsProjective as CurveGroup>::BaseField >>::SignatureVar::new_witness(
-            ark_relations::ns!(cs, "signature"),
+        let signatureVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::SignatureVar::new_variable(
+            ns!(cs, "signature"),
             || Ok(&signature),
+            ark_r1cs_std::alloc::AllocationMode::Witness
         ).unwrap();
 
         let res = MyECDSAGadget::verify(&parameterVar, &pkVar, &hashVar, &signatureVar).unwrap();
-        println!("res: {:?}", res.value().unwrap());
+
+        assert!(res.value().unwrap());
     }
 
-    #[test]
-    fn fp_var_test(){
-        let cs = ark_relations::r1cs::ConstraintSystem::<Fr>::new_ref();
-        let fp_var = FpVar::new_variable(cs.clone(), ||Ok(Fr::rand(&mut ark_std::test_rng())), ark_r1cs_std::alloc::AllocationMode::Witness).unwrap();
-        let fp_var2 = FpVar::new_variable(cs.clone(), ||Ok(Fr::rand(&mut ark_std::test_rng())), ark_r1cs_std::alloc::AllocationMode::Witness).unwrap();
-        let fp_var3 = fp_var.clone().add(&fp_var2);
-        let fp_var4 = fp_var.mul(&fp_var2);
-
-        println!("{:?}",fp_var3)
-    }
 }
+

@@ -116,9 +116,6 @@ impl<C: CurveGroup> SignatureScheme for ECDSA<C> {
             s_inv, hash.0, signature.r, public_key, parameters.generator
         );
 
-        println!("expected pk_x: {:?}", public_key.x().unwrap());
-        println!("expected pk_y: {:?}", public_key.y().unwrap());
-
         let u1 = s_inv * hash.0;
         let u2 = s_inv * signature.r;
 
@@ -161,10 +158,14 @@ mod test {
 
     #[test]
     fn test_base_to_scalar() {
-        let fr_mod = (-ark_bn254::Fr::one()).into_bigint();
-        let fr_mod = ark_bn254::Fq::from_bigint(fr_mod).unwrap();
-        let fr_mod: BigInt<4> = base_to_scalar::<ark_bn254::Fq, ark_bn254::Fr>(&fr_mod).into();
-        assert_eq!(fr_mod, (-ark_bn254::Fr::one()).into_bigint());
+        let mut rng = &mut test_rng();
+        for i in 0..100000 {
+            let fq = ark_bn254::Fq::rand(rng);
+            let fq_bigint = fq.into_bigint();
+            let fr_expect = ark_bn254::Fr::from(fq_bigint);
+            let fr = base_to_scalar::<ark_bn254::Fq, ark_bn254::Fr>(&fq);
+            assert_eq!(fr, fr_expect);
+        }
     }
 
     #[test]

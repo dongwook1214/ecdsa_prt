@@ -254,6 +254,7 @@ where
     let res_expect: FpVar<Fq> = res_expect.iter().sum();
     let res: FpVar<Fq> = quotientVar * modulusVar;
 
+    res.enforce_equal(&numVar)?;
     res.is_eq(&res_expect)
 }
 

@@ -213,9 +213,6 @@ where
         return Err(SynthesisError::AssignmentMissing);
     }
     let quotient_usize = quotient[0] as usize;
-    let quotient = quotient[0];
-    let quotient = Fq::from(quotient);
-    let quotientVar = FpVar::<Fq>::new_witness(cs.clone(), || Ok(quotient))?;
 
     let max_quotient = fq_modulus_big_uint.clone() / modulus_big_uint.clone();
     let max_quotient = max_quotient.to_u64_digits();
@@ -252,10 +249,8 @@ where
         .map(|(x, y)| x * y)
         .collect::<Vec<FpVar<Fq>>>();
     let res_expect: FpVar<Fq> = res_expect.iter().sum();
-    let res: FpVar<Fq> = quotientVar * modulusVar;
 
-    res.enforce_equal(&numVar)?;
-    res.is_eq(&res_expect)
+    numVar.is_eq(&res_expect)
 }
 
 #[cfg(test)]

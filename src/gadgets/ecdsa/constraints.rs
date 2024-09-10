@@ -1,29 +1,31 @@
-use crate::gadgets::ecdsa::{base_to_scalar, Hash, Parameters, PublicKey, Signature, SignatureScheme, ECDSA, scalar_to_base};
+use crate::gadgets::ecdsa::{
+    base_to_scalar, scalar_to_base, Hash, Parameters, PublicKey, Signature, SignatureScheme, ECDSA,
+};
+use ark_bn254::Fq;
 use ark_ec::{AffineRepr, CurveGroup};
+use ark_ed_on_bn254::constraints::FqVar;
 use ark_ff::{BigInt, Field, One, PrimeField};
 use ark_r1cs_std::alloc::{AllocVar, AllocationMode};
 use ark_r1cs_std::boolean::Boolean;
+use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
+use ark_r1cs_std::fields::nonnative::{AllocatedNonNativeFieldVar, NonNativeFieldVar};
 use ark_r1cs_std::fields::FieldVar;
 use ark_r1cs_std::groups::CurveVar;
 use ark_r1cs_std::uint8::UInt8;
 use ark_r1cs_std::{R1CSVar, ToBitsGadget};
+use ark_relations::lc;
 use ark_relations::r1cs::{ConstraintSynthesizer, Namespace, SynthesisError};
 use ark_serialize::CanonicalSerialize;
 use ark_std::Zero;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
-use std::ops::Mul;
-use ark_bn254::Fq;
-use ark_ed_on_bn254::constraints::FqVar;
-use ark_r1cs_std::eq::EqGadget;
-use ark_r1cs_std::fields::nonnative::{AllocatedNonNativeFieldVar, NonNativeFieldVar};
-
-
+use std::ops::{Mul, MulAssign, Sub};
 
 pub trait SignatureVerificationGadget<C: SignatureScheme, ConstraintF: PrimeField> {
     type ParametersVar: AllocVar<C::Parameters, ConstraintF> + Clone;
+    type ModulusVar: AllocVar<ConstraintF, ConstraintF> + Clone;
     type PublicKeyVar: AllocVar<C::PublicKey, ConstraintF> + Clone;
     type SignatureVar: AllocVar<C::Signature, ConstraintF> + Clone;
     type HashVar: AllocVar<C::Hash, ConstraintF> + Clone;
@@ -88,7 +90,7 @@ where
 #[derive(Clone)]
 pub struct SignatureVar<Fr: PrimeField, Fq: PrimeField> {
     pub r: NonNativeFieldVar<Fr, Fq>,
-    pub s: NonNativeFieldVar<Fr,Fq>,
+    pub s: NonNativeFieldVar<Fr, Fq>,
 }
 
 impl<C, Fr, Fq> AllocVar<Signature<C>, Fq> for SignatureVar<Fr, Fq>
@@ -97,15 +99,17 @@ where
     Fr: PrimeField,
     Fq: PrimeField,
 {
-    fn new_variable<T: Borrow<Signature<C>>>(cs: impl Into<Namespace<Fq>>, f: impl FnOnce() -> Result<T, SynthesisError>, mode: AllocationMode) -> Result<Self, SynthesisError> {
+    fn new_variable<T: Borrow<Signature<C>>>(
+        cs: impl Into<Namespace<Fq>>,
+        f: impl FnOnce() -> Result<T, SynthesisError>,
+        mode: AllocationMode,
+    ) -> Result<Self, SynthesisError> {
         let ns = cs.into();
         let cs = ns.cs();
-        f().map(|s|
-            Self {
-                r: NonNativeFieldVar::new_variable(cs.clone(), ||  Ok(s.borrow().r), mode).unwrap(),
-                s: NonNativeFieldVar::new_variable(cs, || Ok(s.borrow().s), mode).unwrap()
-            }
-        )
+        f().map(|s| Self {
+            r: NonNativeFieldVar::new_variable(cs.clone(), || Ok(s.borrow().r), mode).unwrap(),
+            s: NonNativeFieldVar::new_variable(cs, || Ok(s.borrow().s), mode).unwrap(),
+        })
     }
 }
 
@@ -144,6 +148,7 @@ where
     C::BaseField: PrimeField,
 {
     type ParametersVar = ParametersVar<C, GG>;
+    type ModulusVar = FpVar<C::BaseField>;
     type PublicKeyVar = PublicKeyVar<C, GG>;
     type SignatureVar = SignatureVar<C::ScalarField, C::BaseField>;
     type HashVar = HashVar<C::ScalarField, C::BaseField>;
@@ -154,16 +159,13 @@ where
         public_key: &Self::PublicKeyVar,
         hash: &Self::HashVar,
         signature: &Self::SignatureVar,
-        modulus: FpVar<C::BaseField>,
+        modulus: Self::ModulusVar,
     ) -> Result<Boolean<C::BaseField>, SynthesisError> {
         let s_inv = signature.s.inverse()?;
         let h = hash.0.clone();
         let base = parameters.generator.clone();
         let r = signature.r.clone();
         let public_key = public_key.public_key.clone();
-
-        println!("s_inv: {:?} h: {:?} r: {:?} public_key: {:?} base: {:?}", s_inv.value()?, h.value()?, r.value()?, public_key.value()?.into_affine(), base.value()?.into_affine());
-        println!("pk: {:?}", public_key.value()?);
 
         let lhs = s_inv.clone() * h;
         let lhs = lhs.to_bits_le()?;
@@ -174,97 +176,162 @@ where
         let rhs = public_key.scalar_mul_le(rhs.iter())?;
 
         let res = lhs + rhs;
-        println!("lhs + rhs: {:?}", res.value()?.into_affine());
-        println!("lhs + rhs affine_x: {:?}", res.value()?.into_affine().x());
-        println!("lhs + rhs projective: {:?}", res.value()?);
 
         let res = res.to_bits_le()?;
-        let res_x = res[0..res.len()/2].to_vec();
+        let res_x = res[0..res.len() / 2].to_vec();
         let res_x = Boolean::le_bits_to_fp_var(&res_x)?;
 
-        println!("res_x: {:?}", res_x.value()?);
-
-        let mut res_expected = r.to_bits_le()?;
+        let res_expected = r.to_bits_le()?;
         let res_expected = Boolean::le_bits_to_fp_var(&res_expected)?;
-        println!("res_expected: {:?}", res_expected.value()?);
 
         is_same_num_in_mod(res_x.clone(), res_expected.clone(), modulus.clone())
     }
 }
 
-fn is_mod_zero<Fq> (num: FpVar<Fq>, modulus: FpVar<Fq>) -> Result< Boolean<Fq>, SynthesisError> where Fq:PrimeField {
-    let num_value = num.value()?;
-    let modulus_value = modulus.value()?;
-    let quotient_value = num_value / modulus_value;
-    if !num_value.is_zero() && ( quotient_value > num_value || modulus_value > num_value ) {
-        println!("quotient_value: {:?} num_value: {:?} modulus_value: {:?}", quotient_value, num_value, modulus_value);
-        return Ok(Boolean::FALSE)
-    }
-    println!("quotient_value: {:?} ", quotient_value);
-    let quotientVar = FpVar::<Fq>::new_constant(num.cs(), quotient_value)?;
-    quotientVar.enforce_cmp(&num, Ordering::Less, true)?;
-    modulus.enforce_cmp(&num, Ordering::Less, true)?;
-    let resVar = modulus.mul(&quotientVar);
-    resVar.enforce_equal(&num)?;
+fn is_same_num_in_mod<Fq>(
+    num1Var: FpVar<Fq>,
+    num2Var: FpVar<Fq>,
+    modulusVar: FpVar<Fq>,
+) -> Result<Boolean<Fq>, SynthesisError>
+where
+    Fq: PrimeField,
+{
+    let cs = num1Var.cs();
 
-    // let twoVar = FpVar::<Fq>::new_constant(num.cs(), Fq::from(2u32))?;
-    // let quotientVar = quotientVar.mul_by_inverse(&twoVar)?;
-    // let resVar = modulus.mul(&quotientVar);
-    // resVar.enforce_cmp(&num, Ordering::Less, false)?;
-    return Ok(Boolean::TRUE)
-}
-
-fn is_same_num_in_mod<Fq>(num1Var: FpVar<Fq>, num2Var: FpVar<Fq>, modulusVar: FpVar<Fq>) -> Result<Boolean<Fq>, SynthesisError> where Fq:PrimeField {
     let numVar = num1Var - num2Var;
-    let num = numVar.value()?;
-    let modulus = modulusVar.value()?;
-    let quotient = num / modulus;
-    let max_quotient = Fq::MODULUS.into() / modulus.into_bigint().into();
-    let max_quotient = Fq::from_bigint(Fq::BigInt::try_from(max_quotient).unwrap()).unwrap();
+    let num_big_uint = numVar.value().unwrap_or_default().into_bigint().into();
+    let fq_modulus_big_uint = Fq::MODULUS.into();
+    let modulus = modulusVar.value().unwrap_or_default();
+    let modulus_big_uint = modulus.into_bigint().into();
 
-    println!("max_quotient: {:?} quotient: {:?}", max_quotient, quotient);
+    let quotient = num_big_uint.clone() / modulus_big_uint.clone();
+    let mut quotient = quotient.to_u64_digits();
+    if quotient.is_empty() {
+        quotient.push(0)
+    }
+    if quotient.len() != 1 {
+        return Err(SynthesisError::AssignmentMissing);
+    }
+    let quotient_usize = quotient[0] as usize;
+    let quotient = quotient[0];
+    let quotient = Fq::from(quotient);
+    let quotientVar = FpVar::<Fq>::new_witness(cs.clone(), || Ok(quotient))?;
 
-    if quotient > max_quotient {
-        return Ok(Boolean::FALSE)
+    let max_quotient = fq_modulus_big_uint.clone() / modulus_big_uint.clone();
+    let max_quotient = max_quotient.to_u64_digits();
+    if max_quotient.len() != 1 {
+        return Err(SynthesisError::AssignmentMissing);
+    }
+    let max_quotient = max_quotient[0];
+
+    if quotient_usize > max_quotient as usize {
+        return Err(SynthesisError::AssignmentMissing);
     }
 
-    let quotientVar = FpVar::<Fq>::new_witness(numVar.cs(), ||Ok(quotient))?;
-    let maxQuotientVar = FpVar::<Fq>::new_witness(quotientVar.cs(), ||Ok(max_quotient))?;
-    let actual_num = modulusVar.clone().mul(&quotientVar);
-    actual_num.enforce_equal(&numVar)?;
-    quotientVar.enforce_cmp(&maxQuotientVar, Ordering::Less, true)?;
+    let mut quotient_index = vec![Fq::zero(); max_quotient as usize];
+    quotient_index[quotient_usize] = Fq::one();
+    let quotientIndexVar = quotient_index
+        .iter()
+        .map(|x| FpVar::new_witness(cs.clone(), || Ok(*x)).unwrap())
+        .collect::<Vec<FpVar<Fq>>>();
+    quotientIndexVar.iter().for_each(|x| (x.clone() * (x - FpVar::one())).enforce_equal(&FpVar::zero()).unwrap());
 
-    let mustBiggerVar = modulusVar.clone().mul(&maxQuotientVar);
-    let mustSmallerVar = modulusVar.clone().mul(&(maxQuotientVar + FpVar::<Fq>::new_constant(quotientVar.cs(), Fq::one())?));
+    let zero_to_max: Vec<u64> = (0..=max_quotient).collect();
+    let zero_to_max: Vec<Fq> = zero_to_max
+        .iter()
+        .map(|x| Fq::from(*x).mul(modulus))
+        .collect();
+    let zero_to_max = zero_to_max
+        .iter()
+        .map(|x| FpVar::<Fq>::new_constant(cs.clone(), *x).unwrap())
+        .collect::<Vec<FpVar<Fq>>>();
 
-    modulusVar.enforce_cmp(&mustBiggerVar, Ordering::Less, true)?;
-    modulusVar.enforce_cmp(&mustSmallerVar, Ordering::Greater, false)?;
+    let res_expect = zero_to_max
+        .iter()
+        .zip(quotientIndexVar.iter())
+        .map(|(x, y)| x * y)
+        .collect::<Vec<FpVar<Fq>>>();
+    let res_expect: FpVar<Fq> = res_expect.iter().sum();
+    let res: FpVar<Fq> = quotientVar * modulusVar;
 
-    println!("max_quotient: {:?} quotient: {:?}", max_quotient, quotient);
-
-    Ok(Boolean::TRUE)
+    res.is_eq(&res_expect)
 }
 
 #[cfg(test)]
 mod test {
-    use std::ops::{Add, Mul};
+    use super::SignatureVerificationGadget;
+    use crate::gadgets::ecdsa::constraints::ECDSAVerificationGadget;
+    use crate::gadgets::ecdsa::{Hash, Signature, SignatureScheme, ECDSA};
     use ark_bn254;
     use ark_ec::{CurveGroup, Group};
-    use ark_r1cs_std::alloc::AllocVar;
-    use ark_r1cs_std::groups::CurveVar;
-    use crate::gadgets::ecdsa::{Hash, SignatureScheme, ECDSA, Signature};
-    use ark_std::{test_rng, UniformRand};
-    use crate::gadgets::ecdsa::constraints::ECDSAVerificationGadget;
-    use ark_ed_on_bn254::{constraints::EdwardsVar, EdwardsProjective, Fq, Fr};
     use ark_ed_on_bn254::constraints::FqVar;
+    use ark_ed_on_bn254::{constraints::EdwardsVar, EdwardsProjective, Fq, Fr};
     use ark_ff::PrimeField;
+    use ark_r1cs_std::alloc::AllocVar;
     use ark_r1cs_std::boolean::Boolean;
+    use ark_r1cs_std::eq::EqGadget;
     use ark_r1cs_std::fields::fp::FpVar;
     use ark_r1cs_std::groups::curves::twisted_edwards::AffineVar;
+    use ark_r1cs_std::groups::CurveVar;
     use ark_r1cs_std::R1CSVar;
     use ark_relations::ns;
     use ark_relations::r1cs::Namespace;
-    use super::SignatureVerificationGadget;
+    use ark_std::{test_rng, UniformRand};
+    use std::ops::{Add, Mul};
+
+    #[test]
+    fn gadget_verify_test_one_time() {
+        let mut rng = &mut test_rng();
+        type MyECDSA = ECDSA<EdwardsProjective>;
+
+        type MyECDSAGadget = ECDSAVerificationGadget<EdwardsProjective, EdwardsVar>;
+
+        let parameter = MyECDSA::setup(rng).unwrap();
+        let (sk, pk) = MyECDSA::keygen(&parameter, rng).unwrap();
+        let hash = Hash(Fr::rand(rng));
+        let signature = MyECDSA::sign(&parameter, &sk, &hash, rng).unwrap();
+        let predict_res = MyECDSA::verify(&parameter, &pk, &hash, &signature).unwrap();
+
+        let cs = ark_relations::r1cs::ConstraintSystem::<Fq>::new_ref();
+        let parameterVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::ParametersVar::new_variable(
+            ns!(cs, "parameter"),
+            || Ok(&parameter),
+            ark_r1cs_std::alloc::AllocationMode::Constant
+        ).unwrap();
+
+        let pkVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::PublicKeyVar::new_variable(
+            ns!(cs, "pk"),
+            || Ok(&pk),
+            ark_r1cs_std::alloc::AllocationMode::Input
+        ).unwrap();
+
+        let hashVar =
+            <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::HashVar::new_variable(
+                ns!(cs, "hash"),
+                || Ok(&hash),
+                ark_r1cs_std::alloc::AllocationMode::Input,
+            )
+            .unwrap();
+
+        let signatureVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::SignatureVar::new_variable(
+            ns!(cs, "signature"),
+            || Ok(&signature),
+            ark_r1cs_std::alloc::AllocationMode::Witness
+        ).unwrap();
+
+        let modulus = Fr::MODULUS;
+        let modulus = Fq::from_bigint(modulus).unwrap();
+        let modulus = FpVar::<Fq>::new_constant(ns!(cs, "modulus"), modulus).unwrap();
+
+        let res =
+            MyECDSAGadget::verify(&parameterVar, &pkVar, &hashVar, &signatureVar, modulus).unwrap();
+        println!(
+            "check: {:?}",
+            res.is_eq(&Boolean::TRUE).unwrap().value().unwrap()
+        );
+        assert_eq!(res.value().unwrap(), predict_res);
+    }
+
     #[test]
     fn gadget_verify_test() {
         let mut rng = &mut test_rng();
@@ -275,23 +342,16 @@ mod test {
             type MyECDSAGadget = ECDSAVerificationGadget<EdwardsProjective, EdwardsVar>;
 
             let parameter = MyECDSA::setup(rng).unwrap();
-            let (sk, pk) =
-                MyECDSA::keygen(&parameter, rng).unwrap();
+            let (sk, pk) = MyECDSA::keygen(&parameter, rng).unwrap();
             let hash = Hash(Fr::rand(rng));
-            let signature = MyECDSA::sign(
-                &parameter,
-                &sk,
-                &hash,
-                rng,
-            )
-                .unwrap();
+            let signature = MyECDSA::sign(&parameter, &sk, &hash, rng).unwrap();
             let predict_res = MyECDSA::verify(&parameter, &pk, &hash, &signature).unwrap();
 
             let cs = ark_relations::r1cs::ConstraintSystem::<Fq>::new_ref();
             let parameterVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::ParametersVar::new_variable(
                 ns!(cs, "parameter"),
                 || Ok(&parameter),
-                ark_r1cs_std::alloc::AllocationMode::Input
+                ark_r1cs_std::alloc::AllocationMode::Constant
             ).unwrap();
 
             let pkVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::PublicKeyVar::new_variable(
@@ -300,11 +360,13 @@ mod test {
                 ark_r1cs_std::alloc::AllocationMode::Input
             ).unwrap();
 
-            let hashVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::HashVar::new_variable(
-                ns!(cs, "hash"),
-                || Ok(&hash),
-                ark_r1cs_std::alloc::AllocationMode::Input
-            ).unwrap();
+            let hashVar =
+                <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::HashVar::new_variable(
+                    ns!(cs, "hash"),
+                    || Ok(&hash),
+                    ark_r1cs_std::alloc::AllocationMode::Input,
+                )
+                .unwrap();
 
             let signatureVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::SignatureVar::new_variable(
                 ns!(cs, "signature"),
@@ -316,8 +378,13 @@ mod test {
             let modulus = Fq::from_bigint(modulus).unwrap();
             let modulus = FpVar::<Fq>::new_constant(ns!(cs, "modulus"), modulus).unwrap();
 
-            let res = MyECDSAGadget::verify(&parameterVar, &pkVar, &hashVar, &signatureVar, modulus).unwrap();
-
+            let res =
+                MyECDSAGadget::verify(&parameterVar, &pkVar, &hashVar, &signatureVar, modulus)
+                    .unwrap();
+            println!(
+                "check: {:?}",
+                res.is_eq(&Boolean::TRUE).unwrap().value().unwrap()
+            );
             assert_eq!(res.value().unwrap(), predict_res);
         }
     }
@@ -326,21 +393,19 @@ mod test {
     fn gadget_verify_fail_test() {
         let mut rng = &mut test_rng();
 
-
         for i in 0..10 {
             type MyECDSA = ECDSA<EdwardsProjective>;
 
             type MyECDSAGadget = ECDSAVerificationGadget<EdwardsProjective, EdwardsVar>;
 
             let parameter = MyECDSA::setup(rng).unwrap();
-            let (sk, pk) =
-                MyECDSA::keygen(&parameter, rng).unwrap();
+            let (sk, pk) = MyECDSA::keygen(&parameter, rng).unwrap();
             let hash = Hash(Fr::rand(rng));
 
             // generate a fake signature
             let signature = Signature {
                 r: Fr::rand(rng),
-                s: Fr::rand(rng)
+                s: Fr::rand(rng),
             };
 
             let predict_res = MyECDSA::verify(&parameter, &pk, &hash, &signature).unwrap();
@@ -358,11 +423,13 @@ mod test {
                 ark_r1cs_std::alloc::AllocationMode::Input
             ).unwrap();
 
-            let hashVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::HashVar::new_variable(
-                ns!(cs, "hash"),
-                || Ok(&hash),
-                ark_r1cs_std::alloc::AllocationMode::Input
-            ).unwrap();
+            let hashVar =
+                <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::HashVar::new_variable(
+                    ns!(cs, "hash"),
+                    || Ok(&hash),
+                    ark_r1cs_std::alloc::AllocationMode::Input,
+                )
+                .unwrap();
 
             let signatureVar = <MyECDSAGadget as SignatureVerificationGadget<MyECDSA, Fq>>::SignatureVar::new_variable(
                 ns!(cs, "signature"),
@@ -374,11 +441,11 @@ mod test {
             let modulus = Fq::from_bigint(modulus).unwrap();
             let modulus = FpVar::<Fq>::new_constant(ns!(cs, "modulus"), modulus).unwrap();
 
-            let res = MyECDSAGadget::verify(&parameterVar, &pkVar, &hashVar, &signatureVar, modulus).unwrap_or(Boolean::FALSE);
+            let res =
+                MyECDSAGadget::verify(&parameterVar, &pkVar, &hashVar, &signatureVar, modulus)
+                    .unwrap_or(Boolean::FALSE);
 
             assert_eq!(predict_res, res.value().unwrap());
         }
     }
-
 }
-
